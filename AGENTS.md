@@ -24,7 +24,7 @@ If container startup fails with `all predefined address pools have been fully su
 
 ### What "passed" looks like
 
-Failsafe reports `Tests run: 7, Failures: 0, Errors: 0, Skipped: 0` for `E2EGatewayIT`, and the build ends with `BUILD SUCCESS`.
+Failsafe reports `Tests run: 9, Failures: 0, Errors: 0, Skipped: 0` for `E2EGatewayIT`, and the build ends with `BUILD SUCCESS`.
 
 ### When the IT cannot run
 
@@ -57,6 +57,8 @@ javap -c -p -cp target/classes io.fluenthealth.gravitee.policy.webhooksignature.
 - **Secret resolution goes through `TemplateEngine.eval` only.** The synchronous entry points (`getValue`, `convert`, `evalNow`) do not resolve deferred values such as `{#secrets.get(...)}` and return the literal expression without error — which would then become the HMAC key.
 - **No defaults, anywhere.** Configuration fields start null, `gravitee.json` declares no `default`, and `SchemaTest` enforces both. A missing value is a 500 `WEBHOOK_SIGNATURE_MISCONFIGURED`, checked per request rather than at construction, so a bad config fails its own flow rather than the API deployment. That check is the only enforcement: the management API does **not** validate policy configuration against `gravitee.json` (measured — a config missing even a top-level `required` property applies cleanly), so never rely on the schema to keep a bad config out.
 - **Every rejection is a `Rejection` with a stable key**; anything else reaching `toFailure` is a bug and is logged at ERROR as `WEBHOOK_SIGNATURE_ERROR`. Status codes for Mailgun deliberately differ by source (a missing field is 400 for routes, 401 for event webhooks), matching the verifiers this plugin was written to replace.
+- **Mailgun freshness and replay run only after the signature matches**, so `EXPIRED`/`REPLAYED` always describe a genuine delivery. Both are opt-out by a stated value (`maxAgeSeconds = 0`, `replayCache = ""`), which reproduces a plain signature check exactly — the point is that adopting the plugin need not change behaviour. A replay cache without a freshness window is rejected as misconfigured: nothing would ever let a seen token expire. The cache is reached via `getAsync`/`putAsync` so a distributed cache never blocks the event loop; seen tokens live for `2 × maxAgeSeconds`, the longest a token can stay acceptable.
+- The policy takes a `java.time.Clock` (package-private constructor) so tests pin "now"; production uses `Clock.systemUTC()`.
 - `Multipart` reads only plain form fields, views the body as ISO-8859-1 (one char per byte, so binary parts cannot throw or shift offsets), skips file parts, and lets the first occurrence of a repeated name win.
 
 ## Test fixtures

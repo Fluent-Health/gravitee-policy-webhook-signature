@@ -22,7 +22,7 @@ metadata:
   description: Gravitee APIM policy plugin that verifies HMAC-signed inbound webhooks (GitHub, Sentry, Meta/WhatsApp, Mailgun).
   annotations:
     github.com/project-slug: Fluent-Health/gravitee-policy-webhook-signature
-    fluentinhealth.com/oss: published
+    fluentinhealth.com/oss: pending
 spec:
   type: library
   lifecycle: production

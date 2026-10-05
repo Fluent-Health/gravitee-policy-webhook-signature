@@ -50,6 +50,24 @@ public class WebhookSignaturePolicyConfiguration implements PolicyConfiguration 
     /** The HMAC key. May be a template expression, including a deferred {@code {#secrets.get(...)}}. */
     private String secret;
 
+    /**
+     * How far, in seconds, a Mailgun signature's {@code timestamp} may be from the gateway's clock in
+     * either direction. Required for the Mailgun sources, ignored otherwise. Mailgun signs only
+     * {@code timestamp + token} — not the body — so without this bound a captured valid triple would
+     * authenticate any body forever. {@code 0} turns the check off, so that running without it is
+     * always a stated choice.
+     */
+    private Integer maxAgeSeconds;
+
+    /**
+     * Name of a Gravitee cache resource used to refuse a Mailgun {@code token} seen before. Required
+     * for the Mailgun sources, ignored otherwise — the empty string, not null, to opt out, so that
+     * running without replay protection is always a stated choice. Replay protection is only as
+     * wide as the cache: an in-memory cache covers one gateway instance, a distributed one covers
+     * the cluster. {@link #maxAgeSeconds} bounds replay everywhere regardless.
+     */
+    private String replayCache;
+
     public String getSource() {
         return source;
     }
@@ -98,6 +116,26 @@ public class WebhookSignaturePolicyConfiguration implements PolicyConfiguration 
         this.secret = secret;
     }
 
+    public Integer getMaxAgeSeconds() {
+        return maxAgeSeconds;
+    }
+
+    public void setMaxAgeSeconds(Integer maxAgeSeconds) {
+        this.maxAgeSeconds = maxAgeSeconds;
+    }
+
+    public String getReplayCache() {
+        return replayCache;
+    }
+
+    public void setReplayCache(String replayCache) {
+        this.replayCache = replayCache;
+    }
+
+    public boolean isMailgun() {
+        return SOURCE_MAILGUN_JSON.equals(source) || SOURCE_MAILGUN_MULTIPART.equals(source);
+    }
+
     /**
      * Describes the first problem that makes this configuration unusable, or returns null when it
      * is complete. Checked per request rather than at construction, because a policy that cannot
@@ -122,6 +160,17 @@ public class WebhookSignaturePolicyConfiguration implements PolicyConfiguration 
             }
             if (prefix == null) {
                 return "prefix is required when source is 'header' (use \"\" for a bare digest)";
+            }
+        }
+        if (isMailgun()) {
+            if (maxAgeSeconds == null || maxAgeSeconds < 0) {
+                return "maxAgeSeconds is required when source is '" + source + "' (use 0 to opt out)";
+            }
+            if (replayCache == null) {
+                return "replayCache is required when source is '" + source + "' (use \"\" to opt out)";
+            }
+            if (!replayCache.isEmpty() && maxAgeSeconds == 0) {
+                return "replayCache needs a positive maxAgeSeconds: without a freshness window, a seen token can never be forgotten";
             }
         }
         return null;
