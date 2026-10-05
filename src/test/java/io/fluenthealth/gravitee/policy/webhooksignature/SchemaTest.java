@@ -26,8 +26,10 @@ class SchemaTest {
     @Test
     void requiresEverythingThatApplies() {
         assertThat(strings(SCHEMA.get("required"))).containsExactlyInAnyOrder("source", "algorithm", "encoding", "secret");
-        assertThat(SCHEMA.at("/if/properties/source/const").asText()).isEqualTo("header");
-        assertThat(strings(SCHEMA.at("/then/required"))).containsExactlyInAnyOrder("header", "prefix");
+        assertThat(SCHEMA.at("/allOf/0/if/properties/source/const").asText()).isEqualTo("header");
+        assertThat(strings(SCHEMA.at("/allOf/0/then/required"))).containsExactlyInAnyOrder("header", "prefix");
+        assertThat(strings(SCHEMA.at("/allOf/1/if/properties/source/enum"))).containsExactlyInAnyOrder("mailgun-json", "mailgun-multipart");
+        assertThat(strings(SCHEMA.at("/allOf/1/then/required"))).containsExactlyInAnyOrder("maxAgeSeconds", "replayCache");
     }
 
     @Test

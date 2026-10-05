@@ -9,12 +9,17 @@ import io.gravitee.gateway.api.buffer.Buffer;
 import io.gravitee.gateway.reactive.api.ExecutionFailure;
 import io.gravitee.gateway.reactive.api.context.http.HttpPlainExecutionContext;
 import io.gravitee.gateway.reactive.api.policy.http.HttpPolicy;
+import io.gravitee.resource.api.ResourceManager;
+import io.gravitee.resource.cache.api.Cache;
+import io.gravitee.resource.cache.api.CacheResource;
+import io.gravitee.resource.cache.api.Element;
 import io.reactivex.rxjava3.core.Completable;
 import io.reactivex.rxjava3.core.Maybe;
 import io.reactivex.rxjava3.core.Single;
 import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
 import java.security.MessageDigest;
+import java.time.Clock;
 import java.util.Base64;
 import java.util.HexFormat;
 import java.util.List;
@@ -31,6 +36,12 @@ import org.slf4j.LoggerFactory;
  * missing or malformed signature, a missing secret, an unreadable body — and nothing on those
  * paths can throw its way to an unexplained 500. The request body is read but never rewritten:
  * the buffer that was verified is the buffer that is forwarded, byte for byte.
+ *
+ * <p>Mailgun signs only {@code timestamp + token}, not the body, so for the Mailgun sources an
+ * authentic signature can additionally be required to be recent ({@code maxAgeSeconds} above 0)
+ * and, when a {@code replayCache} is configured, not seen before. Both are opt-out with a stated
+ * value, so a deployment can start with exactly a signature check and tighten later. Both checks run only after the signature has
+ * matched, so a rejection for staleness or replay always describes a genuine delivery.
  *
  * <p>Each failure carries a stable {@link ExecutionFailure#key() key}, so status and body can be
  * customised per failure with the API's response templates instead of policy configuration.
@@ -53,15 +64,27 @@ public class WebhookSignaturePolicy implements HttpPolicy {
     public static final String KEY_SECRET_UNRESOLVED = "WEBHOOK_SIGNATURE_SECRET_UNRESOLVED";
     /** The body cannot carry a Mailgun signature at all: not JSON, or not multipart. */
     public static final String KEY_BODY_INVALID = "WEBHOOK_SIGNATURE_BODY_INVALID";
+    /** A Mailgun signature is authentic but its timestamp is outside {@code maxAgeSeconds}. */
+    public static final String KEY_EXPIRED = "WEBHOOK_SIGNATURE_EXPIRED";
+    /** A Mailgun signature is authentic but its token has been seen before. */
+    public static final String KEY_REPLAYED = "WEBHOOK_SIGNATURE_REPLAYED";
+    /** The replay cache could not be read or written. */
+    public static final String KEY_REPLAY_CACHE_UNAVAILABLE = "WEBHOOK_SIGNATURE_REPLAY_CACHE_UNAVAILABLE";
     /** The policy configuration is incomplete or invalid. */
     public static final String KEY_MISCONFIGURED = "WEBHOOK_SIGNATURE_MISCONFIGURED";
     /** Verification failed for a reason none of the above describes — a bug, not a sender error. */
     public static final String KEY_ERROR = "WEBHOOK_SIGNATURE_ERROR";
 
     private final WebhookSignaturePolicyConfiguration configuration;
+    private final Clock clock;
 
     public WebhookSignaturePolicy(WebhookSignaturePolicyConfiguration configuration) {
+        this(configuration, Clock.systemUTC());
+    }
+
+    WebhookSignaturePolicy(WebhookSignaturePolicyConfiguration configuration, Clock clock) {
         this.configuration = configuration;
+        this.clock = clock;
     }
 
     @Override
@@ -101,13 +124,24 @@ public class WebhookSignaturePolicy implements HttpPolicy {
                 if (!matches(secret, signed)) {
                     throw new Rejection(401, KEY_INVALID, "Invalid signature");
                 }
-                return Completable.complete();
+                if (signed.timestamp() == null || configuration.getMaxAgeSeconds() == 0) {
+                    return Completable.complete();
+                }
+                checkFresh(signed.timestamp());
+                return checkNotReplayed(ctx, signed.token());
             });
         });
     }
 
-    /** The digest as presented by the sender, and the exact bytes it claims to sign. */
-    record Signed(String signature, byte[] message) {}
+    /**
+     * The digest as presented by the sender and the exact bytes it claims to sign. For Mailgun, also
+     * the signed timestamp and token, which are checked for freshness and reuse; null otherwise.
+     */
+    record Signed(String signature, byte[] message, String timestamp, String token) {
+        Signed(String signature, byte[] message) {
+            this(signature, message, null, null);
+        }
+    }
 
     private Signed extract(HttpPlainExecutionContext ctx, byte[] body) {
         return switch (configuration.getSource()) {
@@ -154,7 +188,7 @@ public class WebhookSignaturePolicy implements HttpPolicy {
         if (timestamp == null || token == null || signature == null) {
             throw new Rejection(401, KEY_MISSING, "Mailgun signature fields are missing");
         }
-        return new Signed(signature, (timestamp + token).getBytes(StandardCharsets.UTF_8));
+        return new Signed(signature, (timestamp + token).getBytes(StandardCharsets.UTF_8), timestamp, token);
     }
 
     private static String scalar(JsonNode parent, String field) {
@@ -186,7 +220,7 @@ public class WebhookSignaturePolicy implements HttpPolicy {
         if (timestamp == null || token == null || signature == null) {
             throw new Rejection(400, KEY_MISSING, "Mailgun signature fields are missing");
         }
-        return new Signed(signature, (timestamp + token).getBytes(StandardCharsets.UTF_8));
+        return new Signed(signature, (timestamp + token).getBytes(StandardCharsets.UTF_8), timestamp, token);
     }
 
     private static String nonEmpty(String value) {
@@ -228,6 +262,66 @@ public class WebhookSignaturePolicy implements HttpPolicy {
         // does not reveal how much of a guess was right.
         return MessageDigest.isEqual(mac.doFinal(signed.message()), presented);
     }
+
+    // ── Mailgun freshness and replay ─────────────────────────────────────────
+
+    /** Rejects a timestamp further than {@code maxAgeSeconds} from now, in either direction. */
+    private void checkFresh(String timestamp) {
+        long signedAt;
+        try {
+            signedAt = Long.parseLong(timestamp);
+        } catch (NumberFormatException e) {
+            throw new Rejection(401, KEY_MALFORMED, "Mailgun timestamp is not a number of seconds");
+        }
+        var skew = Math.abs(clock.instant().getEpochSecond() - signedAt);
+        if (skew > configuration.getMaxAgeSeconds()) {
+            throw new Rejection(401, KEY_EXPIRED, "Webhook signature has expired");
+        }
+    }
+
+    /**
+     * Refuses a token already in the replay cache, and records this one. Lookup and record are two
+     * operations, so two copies of a delivery arriving at the same instant can both pass; the
+     * freshness window still bounds that.
+     */
+    private Completable checkNotReplayed(HttpPlainExecutionContext ctx, String token) {
+        var name = configuration.getReplayCache();
+        if (name.isEmpty()) {
+            return Completable.complete();
+        }
+        return Completable.defer(() -> {
+            var resource = ctx.getComponent(ResourceManager.class).getResource(name, CacheResource.class);
+            if (resource == null) {
+                log.error("Webhook signature policy is misconfigured: cache resource [{}] not found", name);
+                throw new Rejection(500, KEY_MISCONFIGURED, "Webhook signature policy is misconfigured");
+            }
+            Cache cache = resource.getCache(ctx);
+            var key = "webhook-signature:mailgun:" + token;
+            // Long enough to outlive the token's validity: a timestamp up to maxAge in the future
+            // stays acceptable until maxAge after it.
+            var ttl = 2 * configuration.getMaxAgeSeconds();
+            return Maybe
+                .fromCompletionStage(cache.getAsync(key).toCompletionStage())
+                .filter(element -> element.value() != null)
+                .isEmpty()
+                .onErrorResumeNext(e -> Single.error(replayCacheUnavailable(name, e)))
+                .flatMapCompletable(unseen -> {
+                    if (!unseen) {
+                        throw new Rejection(401, KEY_REPLAYED, "Webhook signature has already been used");
+                    }
+                    return Completable
+                        .fromCompletionStage(cache.putAsync(new SeenToken(key, Boolean.TRUE, ttl)).toCompletionStage())
+                        .onErrorResumeNext(e -> Completable.error(replayCacheUnavailable(name, e)));
+                });
+        });
+    }
+
+    private static Rejection replayCacheUnavailable(String name, Throwable cause) {
+        log.warn("Replay cache [{}] unavailable: {}", name, cause.toString());
+        return new Rejection(500, KEY_REPLAY_CACHE_UNAVAILABLE, "Webhook replay check unavailable");
+    }
+
+    private record SeenToken(Object key, Object value, int timeToLive) implements Element {}
 
     // ── Failure mapping ───────────────────────────────────────────────────────
 

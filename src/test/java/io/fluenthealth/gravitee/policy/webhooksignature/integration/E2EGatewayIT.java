@@ -14,6 +14,11 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Duration;
+import java.time.Instant;
+import java.util.HexFormat;
+import java.util.UUID;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -40,7 +45,8 @@ import org.testcontainers.utility.MountableFile;
  * <p>What it proves that the unit tests cannot: the management API accepts the schema; the gateway
  * hands the policy the same raw bytes the sender signed; template expressions in {@code secret}
  * resolve on the real engine; a verified multipart body — binary attachment included — reaches the
- * backend byte for byte; and a flow the management API let through with an incomplete
+ * backend byte for byte; Mailgun freshness and replay checks work against a real cache resource,
+ * and are off when configured off; and a flow the management API let through with an incomplete
  * configuration still fails closed.
  */
 public class E2EGatewayIT {
@@ -224,11 +230,46 @@ public class E2EGatewayIT {
     }
 
     @Test
-    void mailgunEventIsVerifiedFromTheJsonBody() throws Exception {
-        var body = fixture("mailgun-event.json");
+    void mailgunRouteWithFreshnessAndReplayOffAcceptsAnOldRepeatedDelivery() throws Exception {
+        // maxAgeSeconds = 0, replayCache = "": a plain signature check, as before tightening.
+        var body = fixture("mailgun-route.multipart");
+
+        assertThat(post("/mailgun-route", body, MAILGUN_CONTENT_TYPE, null).statusCode()).isEqualTo(200);
+        assertThat(post("/mailgun-route", body, MAILGUN_CONTENT_TYPE, null).statusCode()).isEqualTo(200);
+        wireMockClient.verifyThat(2, postRequestedFor(urlEqualTo("/backend/mailgun-route")));
+    }
+
+    @Test
+    void mailgunEventFreshDeliveryPassesOnceThenIsRefusedAsAReplay() throws Exception {
+        var body = mailgunEvent(Instant.now().getEpochSecond(), UUID.randomUUID().toString().replace("-", ""));
 
         assertThat(post("/mailgun-event", body, "application/json", null).statusCode()).isEqualTo(200);
+        var replay = post("/mailgun-event", body, "application/json", null);
+
+        assertThat(replay.statusCode()).isEqualTo(401);
+        assertThat(new String(replay.body())).contains("already been used");
         wireMockClient.verifyThat(1, postRequestedFor(urlEqualTo("/backend/mailgun-event")).withRequestBody(binaryEqualTo(body)));
+    }
+
+    @Test
+    void mailgunEventWithAnOldTimestampIsRefusedAsExpired() throws Exception {
+        // The fixture is authentically signed, but in 2025.
+        var response = post("/mailgun-event", fixture("mailgun-event.json"), "application/json", null);
+
+        assertThat(response.statusCode()).isEqualTo(401);
+        assertThat(new String(response.body())).contains("expired");
+        wireMockClient.verifyThat(0, anyRequestedFor(urlPathMatching("/backend/.*")));
+    }
+
+    /** A Mailgun event signed now. Signing here is test scaffolding; the unit tests pin the HMAC to external vectors. */
+    private static byte[] mailgunEvent(long timestamp, String token) throws Exception {
+        var mac = Mac.getInstance("HmacSHA256");
+        mac.init(new SecretKeySpec(MAILGUN_KEY.getBytes(java.nio.charset.StandardCharsets.UTF_8), "HmacSHA256"));
+        var signature = HexFormat.of().formatHex(mac.doFinal((timestamp + token).getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        return (
+            "{\"signature\":{\"timestamp\":\"" + timestamp + "\",\"token\":\"" + token + "\",\"signature\":\"" + signature + "\"}," +
+            "\"event-data\":{\"event\":\"delivered\",\"recipient\":\"alice@example.com\"}}"
+        ).getBytes(java.nio.charset.StandardCharsets.UTF_8);
     }
 
     @Test
@@ -303,10 +344,12 @@ public class E2EGatewayIT {
                 policy  = "webhook-signature"
                 enabled = true
                 configuration = jsonencode({
-                  source    = "mailgun-multipart"
-                  algorithm = "HmacSHA256"
-                  encoding  = "hex"
-                  secret    = "%s"
+                  source        = "mailgun-multipart"
+                  algorithm     = "HmacSHA256"
+                  encoding      = "hex"
+                  secret        = "%s"
+                  maxAgeSeconds = 0
+                  replayCache   = ""
                 })
               }]
             },
@@ -318,10 +361,12 @@ public class E2EGatewayIT {
                 policy  = "webhook-signature"
                 enabled = true
                 configuration = jsonencode({
-                  source    = "mailgun-json"
-                  algorithm = "HmacSHA256"
-                  encoding  = "hex"
-                  secret    = "%s"
+                  source        = "mailgun-json"
+                  algorithm     = "HmacSHA256"
+                  encoding      = "hex"
+                  secret        = "%s"
+                  maxAgeSeconds = 300
+                  replayCache   = "replay-cache"
                 })
               }]
             },
@@ -342,6 +387,17 @@ public class E2EGatewayIT {
               }]
             },
           ]
+
+          resources = [{
+            name    = "replay-cache"
+            type    = "cache"
+            enabled = true
+            configuration = jsonencode({
+              timeToIdleSeconds   = 0
+              timeToLiveSeconds   = 600
+              maxEntriesLocalHeap = 1000
+            })
+          }]
 
           plans = [{
             name     = "Keyless"

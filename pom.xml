@@ -23,7 +23,9 @@
         <gravitee-policy-api.version>1.11.0</gravitee-policy-api.version>
         <gravitee-gateway-api.version>6.3.0</gravitee-gateway-api.version>
         <gravitee-common.version>5.0.0</gravitee-common.version>
-        <!-- Never referenced by the policy; on the test classpath only so Buffer.buffer(...) has its Vert.x backing. -->
+        <gravitee-resource-api.version>1.1.0</gravitee-resource-api.version>
+        <gravitee-resource-cache-provider-api.version>2.2.0</gravitee-resource-cache-provider-api.version>
+        <!-- Cache.getAsync/putAsync return Vert.x Futures; also backs Buffer.buffer(...) in tests. -->
         <vertx.version>5.0.12</vertx.version>
         <jackson-databind.version>2.22.1</jackson-databind.version>
         <junit-jupiter.version>5.10.2</junit-jupiter.version>
@@ -62,6 +64,18 @@
             <groupId>io.gravitee.common</groupId>
             <artifactId>gravitee-common</artifactId>
             <version>${gravitee-common.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.gravitee.resource</groupId>
+            <artifactId>gravitee-resource-api</artifactId>
+            <version>${gravitee-resource-api.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.gravitee.resource</groupId>
+            <artifactId>gravitee-resource-cache-provider-api</artifactId>
+            <version>${gravitee-resource-cache-provider-api.version}</version>
             <scope>provided</scope>
         </dependency>
         <dependency>

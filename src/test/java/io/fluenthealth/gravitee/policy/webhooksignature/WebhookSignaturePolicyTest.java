@@ -4,6 +4,7 @@ import static io.fluenthealth.gravitee.policy.webhooksignature.WebhookSignatureP
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.when;
 
 import io.fluenthealth.gravitee.policy.webhooksignature.configuration.WebhookSignaturePolicyConfiguration;
@@ -13,11 +14,21 @@ import io.gravitee.gateway.api.http.HttpHeaders;
 import io.gravitee.gateway.reactive.api.ExecutionFailure;
 import io.gravitee.gateway.reactive.api.context.http.HttpPlainExecutionContext;
 import io.gravitee.gateway.reactive.api.context.http.HttpPlainRequest;
+import io.gravitee.resource.api.ResourceManager;
+import io.gravitee.resource.cache.api.Cache;
+import io.gravitee.resource.cache.api.CacheResource;
+import io.gravitee.resource.cache.api.Element;
+import io.vertx.core.Future;
 import io.reactivex.rxjava3.core.Maybe;
 import io.reactivex.rxjava3.core.MaybeTransformer;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
+import java.time.Instant;
+import java.time.ZoneOffset;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -52,8 +63,18 @@ class WebhookSignaturePolicyTest {
     @Mock
     TemplateEngine templateEngine;
 
+    @Mock
+    ResourceManager resourceManager;
+
+    @Mock
+    CacheResource<?> cacheResource;
+
     HttpHeaders headers;
     WebhookSignaturePolicyConfiguration configuration;
+    MapCache replayCache;
+
+    /** Thirty seconds after the fixtures' Mailgun timestamp: comfortably fresh. */
+    Clock clock = clockAt(Vectors.MAILGUN_TIMESTAMP + 30);
 
     @BeforeEach
     void setUp() {
@@ -62,6 +83,10 @@ class WebhookSignaturePolicyTest {
         when(ctx.request()).thenReturn(request);
         when(request.headers()).thenReturn(headers);
         when(ctx.getTemplateEngine()).thenReturn(templateEngine);
+        replayCache = new MapCache();
+        when(ctx.getComponent(ResourceManager.class)).thenReturn(resourceManager);
+        when(resourceManager.getResource("replay", CacheResource.class)).thenReturn(cacheResource);
+        when(cacheResource.getCache(ctx)).thenReturn(replayCache);
         // eval, not getValue: only eval resolves a deferred value. Identity by default.
         when(templateEngine.<String>eval(any(String.class), eq(String.class))).thenAnswer(inv -> Maybe.just(inv.getArgument(0)));
     }
@@ -390,6 +415,126 @@ class WebhookSignaturePolicyTest {
         }
     }
 
+    // ── Mailgun: freshness and replay ────────────────────────────────────────
+
+    @Nested
+    class MailgunFreshnessAndReplay {
+
+        @BeforeEach
+        void configure() {
+            mailgun(WebhookSignaturePolicyConfiguration.SOURCE_MAILGUN_JSON);
+            configuration.setMaxAgeSeconds(300);
+        }
+
+        @Test
+        void maxAgeZeroAcceptsAnyAgeAndAnyRepeat() {
+            // The opt-out: behaves exactly like a plain signature check, however old or repeated.
+            configuration.setMaxAgeSeconds(0);
+            clock = clockAt(Vectors.MAILGUN_TIMESTAMP + 10 * 365 * 24 * 3600L);
+            assertPassed(run(fixture("mailgun-event.json")));
+            assertPassed(run(fixture("mailgun-event.json")));
+        }
+
+        @Test
+        void acceptsASignatureExactlyAtTheLimit() {
+            clock = clockAt(Vectors.MAILGUN_TIMESTAMP + 300);
+            assertPassed(run(fixture("mailgun-event.json")));
+        }
+
+        @Test
+        void rejectsAStaleSignature() {
+            clock = clockAt(Vectors.MAILGUN_TIMESTAMP + 301);
+            assertRejected(run(fixture("mailgun-event.json")), 401, KEY_EXPIRED);
+        }
+
+        @Test
+        void rejectsASignatureFromTooFarInTheFuture() {
+            clock = clockAt(Vectors.MAILGUN_TIMESTAMP - 301);
+            assertRejected(run(fixture("mailgun-event.json")), 401, KEY_EXPIRED);
+        }
+
+        @Test
+        void aForgedSignatureIsInvalidNotExpired() {
+            clock = clockAt(Vectors.MAILGUN_TIMESTAMP + 10_000);
+            var body = json(
+                "{\"signature\":{\"timestamp\":\"%d\",\"token\":\"%s\",\"signature\":\"%s\"}}",
+                Vectors.MAILGUN_TIMESTAMP + 1,
+                Vectors.MAILGUN_TOKEN,
+                Vectors.MAILGUN_SIGNATURE
+            );
+            assertRejected(run(body), 401, KEY_INVALID);
+        }
+
+        @Test
+        void rejectsAnAuthenticSignatureOverANonNumericTimestamp() {
+            var body = json(
+                "{\"signature\":{\"timestamp\":\"not-a-number\",\"token\":\"%s\",\"signature\":\"%s\"}}",
+                Vectors.MAILGUN_TOKEN,
+                Vectors.MAILGUN_NON_NUMERIC_TIMESTAMP_SIGNATURE
+            );
+            assertRejected(run(body), 401, KEY_MALFORMED);
+        }
+
+        @Test
+        void refusesATokenSeenBefore() {
+            configuration.setReplayCache("replay");
+
+            assertPassed(run(fixture("mailgun-event.json")));
+            assertRejected(run(fixture("mailgun-event.json")), 401, KEY_REPLAYED);
+        }
+
+        @Test
+        void recordsTheTokenForTwiceTheWindow() {
+            configuration.setReplayCache("replay");
+            assertPassed(run(fixture("mailgun-event.json")));
+
+            var seen = replayCache.entries.get("webhook-signature:mailgun:" + Vectors.MAILGUN_TOKEN);
+            assertThat(seen).isNotNull();
+            assertThat(seen.timeToLive()).isEqualTo(600);
+        }
+
+        @Test
+        void refusesARouteTokenSeenBefore() {
+            mailgun(WebhookSignaturePolicyConfiguration.SOURCE_MAILGUN_MULTIPART);
+            configuration.setMaxAgeSeconds(300);
+            configuration.setReplayCache("replay");
+            headers.set("Content-Type", MailgunRoute.CONTENT_TYPE);
+
+            assertPassed(run(fixture("mailgun-route.multipart")));
+            assertRejected(run(fixture("mailgun-route.multipart")), 401, KEY_REPLAYED);
+        }
+
+        @Test
+        void rejectedDeliveriesAreNotRecorded() {
+            configuration.setReplayCache("replay");
+            clock = clockAt(Vectors.MAILGUN_TIMESTAMP + 301);
+            assertRejected(run(fixture("mailgun-event.json")), 401, KEY_EXPIRED);
+
+            assertThat(replayCache.entries).isEmpty();
+        }
+
+        @Test
+        void anEmptyReplayCacheNameOptsOut() {
+            configuration.setReplayCache("");
+            assertPassed(run(fixture("mailgun-event.json")));
+            assertPassed(run(fixture("mailgun-event.json")));
+            assertThat(replayCache.entries).isEmpty();
+        }
+
+        @Test
+        void aMissingCacheResourceIsMisconfigured() {
+            configuration.setReplayCache("no-such-cache");
+            assertRejected(run(fixture("mailgun-event.json")), 500, KEY_MISCONFIGURED);
+        }
+
+        @Test
+        void aFailingCacheFailsClosed() {
+            configuration.setReplayCache("replay");
+            replayCache.failing = true;
+            assertRejected(run(fixture("mailgun-event.json")), 500, KEY_REPLAY_CACHE_UNAVAILABLE);
+        }
+    }
+
     // ── Algorithms and encodings beyond the five live dialects ───────────────
 
     @Nested
@@ -491,6 +636,8 @@ class WebhookSignaturePolicyTest {
             assertThat(fresh.getAlgorithm()).isNull();
             assertThat(fresh.getEncoding()).isNull();
             assertThat(fresh.getSecret()).isNull();
+            assertThat(fresh.getMaxAgeSeconds()).isNull();
+            assertThat(fresh.getReplayCache()).isNull();
         }
 
         @Test
@@ -534,6 +681,42 @@ class WebhookSignaturePolicyTest {
         }
 
         @Test
+        void missingMaxAgeForMailgun() {
+            mailgun(WebhookSignaturePolicyConfiguration.SOURCE_MAILGUN_JSON);
+            configuration.setMaxAgeSeconds(null);
+            assertRejected(run(fixture("mailgun-event.json")), 500, KEY_MISCONFIGURED);
+        }
+
+        @Test
+        void negativeMaxAgeForMailgun() {
+            mailgun(WebhookSignaturePolicyConfiguration.SOURCE_MAILGUN_JSON);
+            configuration.setMaxAgeSeconds(-1);
+            assertRejected(run(fixture("mailgun-event.json")), 500, KEY_MISCONFIGURED);
+        }
+
+        @Test
+        void aReplayCacheWithoutAFreshnessWindow() {
+            mailgun(WebhookSignaturePolicyConfiguration.SOURCE_MAILGUN_JSON);
+            configuration.setReplayCache("replay");
+            assertRejected(run(fixture("mailgun-event.json")), 500, KEY_MISCONFIGURED);
+        }
+
+        @Test
+        void missingReplayCacheForMailgun() {
+            mailgun(WebhookSignaturePolicyConfiguration.SOURCE_MAILGUN_MULTIPART);
+            configuration.setReplayCache(null);
+            headers.set("Content-Type", MailgunRoute.CONTENT_TYPE);
+            assertRejected(run(fixture("mailgun-route.multipart")), 500, KEY_MISCONFIGURED);
+        }
+
+        @Test
+        void maxAgeAndReplayCacheAreNotNeededForHeaderSources() {
+            assertThat(configuration.getMaxAgeSeconds()).isNull();
+            assertThat(configuration.getReplayCache()).isNull();
+            assertPassed(run(fixture("github-ping.json")));
+        }
+
+        @Test
         void headerAndPrefixAreNotNeededForMailgun() {
             mailgun(WebhookSignaturePolicyConfiguration.SOURCE_MAILGUN_JSON);
             assertThat(configuration.getHeader()).isNull();
@@ -555,6 +738,9 @@ class WebhookSignaturePolicyTest {
         static final String MAILGUN_KEY = "mailgun-signing-key-test";
         static final String MAILGUN_TOKEN = "a8ce0edb2dd8301dee6c2405235584e45aa91d1e9f979f3de0";
         static final String MAILGUN_SIGNATURE = "36815bffa9a4fa3c79f099854df1497b651fa6c73eb787efb08b79620186eef3";
+        static final long MAILGUN_TIMESTAMP = 1749416383L;
+        // HMAC-SHA256(MAILGUN_KEY, "not-a-number" + MAILGUN_TOKEN)
+        static final String MAILGUN_NON_NUMERIC_TIMESTAMP_SIGNATURE = "03bd10ac4cfc3436c7aa363e3ac55394f445896d9e3c96aef2c1621511a5fd14";
         static final String EMPTY_BODY_GITHUB = "cdc2fd20c6dbbbfe408ddbf774f02af53bc965c8b459f6da5eb6e2bfe20f8f2b";
     }
 
@@ -576,6 +762,64 @@ class WebhookSignaturePolicyTest {
         configuration.setAlgorithm("HmacSHA256");
         configuration.setEncoding("hex");
         configuration.setSecret(Vectors.MAILGUN_KEY);
+        // Exactly the behaviour of a plain signature check; the freshness/replay tests opt in.
+        configuration.setMaxAgeSeconds(0);
+        configuration.setReplayCache("");
+    }
+
+    private static Clock clockAt(long epochSecond) {
+        return Clock.fixed(Instant.ofEpochSecond(epochSecond), ZoneOffset.UTC);
+    }
+
+    /** An in-memory {@link Cache} whose async calls can be made to fail. */
+    static final class MapCache implements Cache {
+
+        final Map<Object, Element> entries = new HashMap<>();
+        boolean failing;
+
+        @Override
+        public String getName() {
+            return "replay";
+        }
+
+        @Override
+        public Object getNativeCache() {
+            return entries;
+        }
+
+        @Override
+        public Element get(Object key) {
+            return entries.get(key);
+        }
+
+        @Override
+        public void put(Element element) {
+            entries.put(element.key(), element);
+        }
+
+        @Override
+        public void evict(Object key) {
+            entries.remove(key);
+        }
+
+        @Override
+        public void clear() {
+            entries.clear();
+        }
+
+        @Override
+        public Future<Element> getAsync(Object key) {
+            return failing ? Future.failedFuture("cache down") : Future.succeededFuture(get(key));
+        }
+
+        @Override
+        public Future<Void> putAsync(Element element) {
+            if (failing) {
+                return Future.failedFuture("cache down");
+            }
+            put(element);
+            return Future.succeededFuture();
+        }
     }
 
     private void secretResolvesTo(Maybe<String> resolution) {
@@ -591,19 +835,25 @@ class WebhookSignaturePolicyTest {
         var forwarded = new AtomicReference<Buffer>();
         var failure = new AtomicReference<ExecutionFailure>();
 
-        when(request.onBody(any())).thenAnswer(inv -> {
+        // doAnswer, not when(...): re-stubbing with when() for a second run() in the same test would
+        // invoke the previous answer with a null argument.
+        doAnswer(inv -> {
             MaybeTransformer<Buffer, Buffer> transformer = inv.getArgument(0);
             var upstream = received == null ? Maybe.<Buffer>empty() : Maybe.just(received);
             return Maybe.wrap(transformer.apply(upstream)).doOnSuccess(forwarded::set).ignoreElement();
-        });
-        when(ctx.interruptBodyWith(any(ExecutionFailure.class))).thenAnswer(inv -> {
+        })
+            .when(request)
+            .onBody(any());
+        doAnswer(inv -> {
             failure.set(inv.getArgument(0));
             return Maybe.error(new IllegalStateException("interrupted"));
-        });
+        })
+            .when(ctx)
+            .interruptBodyWith(any(ExecutionFailure.class));
 
         boolean completed;
         try {
-            new WebhookSignaturePolicy(configuration).onRequest(ctx).timeout(5, TimeUnit.SECONDS).blockingAwait();
+            new WebhookSignaturePolicy(configuration, clock).onRequest(ctx).timeout(5, TimeUnit.SECONDS).blockingAwait();
             completed = true;
         } catch (RuntimeException e) {
             completed = false;

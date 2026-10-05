@@ -47,6 +47,8 @@ The schema is deliberately flat and has **no defaults**: an API definition alway
 | `algorithm` | yes | `HmacSHA1`, `HmacSHA256` or `HmacSHA512`. |
 | `encoding` | yes | `hex` or `base64` — how the received digest is encoded. |
 | `secret` | yes | The HMAC key. Supports Expression Language. |
+| `maxAgeSeconds` | when `source` is `mailgun-*` | Reject an authentic signature whose timestamp is further than this from the gateway clock, either direction. `0` turns the check off. |
+| `replayCache` | when `source` is `mailgun-*` | Name of a cache resource used to refuse a token seen before. `""` turns the check off. Needs `maxAgeSeconds` above `0`. |
 
 The schema states these requirements (including the conditional one, as a draft-07 `if`/`then`), but **the management API does not validate policy configuration against it** — an incomplete configuration deploys without complaint. The policy therefore re-checks the whole configuration on every request and answers 500 (`WEBHOOK_SIGNATURE_MISCONFIGURED`) without reaching the backend if anything is missing.
 
@@ -88,12 +90,38 @@ Mailgun event webhooks and routes — the signing key is Mailgun's *HTTP webhook
 
 ```hcl
 configuration = jsonencode({
-  source    = "mailgun-json"        # or "mailgun-multipart" for routes
-  algorithm = "HmacSHA256"
-  encoding  = "hex"
-  secret    = "{#secrets.get('/my-provider/mailgun:webhook-signing-key')}"
+  source        = "mailgun-json"        # or "mailgun-multipart" for routes
+  algorithm     = "HmacSHA256"
+  encoding      = "hex"
+  secret        = "{#secrets.get('/my-provider/mailgun:webhook-signing-key')}"
+  maxAgeSeconds = 300
+  replayCache   = "webhook-replay-cache"
 })
+
+# On the API:
+resources = [{
+  name    = "webhook-replay-cache"
+  type    = "cache"                     # in-memory: per gateway instance
+  enabled = true
+  configuration = jsonencode({ timeToIdleSeconds = 0, timeToLiveSeconds = 600, maxEntriesLocalHeap = 10000 })
+}]
 ```
+
+### Mailgun: adopt as-is, tighten later
+
+Mailgun signs only `timestamp + token`, never the body, so a signature check alone lets a captured delivery be replayed with any body, indefinitely. The two Mailgun-only properties close that, following [Mailgun's own guidance](https://documentation.mailgun.com/docs/mailgun/user-manual/webhooks/securing-webhooks):
+
+- `maxAgeSeconds` bounds a replay to a window around the signed timestamp, on every gateway instance.
+- `replayCache` refuses a token already seen inside that window. Its reach is the cache's: an in-memory `cache` resource covers one gateway instance, a distributed one (e.g. Redis) the whole cluster. Lookup and record are two operations, so two identical deliveries racing on the same instance can both pass.
+
+Both are required and both can be switched off with a stated value, so replacing an existing signature check changes nothing on day one:
+
+```hcl
+maxAgeSeconds = 0     # no freshness check
+replayCache   = ""    # no replay check
+```
+
+Tighten later as a configuration change. Choose the window with delivery delays in mind — Mailgun itself warns that webhook processing can be delayed outside its control, and it retries failed deliveries for hours; if a retry carries its original timestamp, a short window turns a backend outage into lost events. Both checks run only after the signature has matched, so an `EXPIRED` or `REPLAYED` rejection always describes a genuine Mailgun delivery: watch those keys after setting a window.
 
 ## Failures
 
@@ -102,18 +130,21 @@ Every rejection carries a stable key. To change the status or body a sender sees
 | Key | Status | When |
 | --- | --- | --- |
 | `WEBHOOK_SIGNATURE_MISSING` | 401 (400 for `mailgun-multipart`) | No signature: header absent or blank, or Mailgun signature fields missing. |
-| `WEBHOOK_SIGNATURE_MALFORMED` | 401 | The header does not hold the configured prefix followed by a digest. |
+| `WEBHOOK_SIGNATURE_MALFORMED` | 401 | The header does not hold the configured prefix followed by a digest, or an authentic Mailgun timestamp is not a number. |
 | `WEBHOOK_SIGNATURE_INVALID` | 401 | The signature does not match, or is not a well-formed digest. |
+| `WEBHOOK_SIGNATURE_EXPIRED` | 401 | Mailgun: authentic, but the timestamp is outside `maxAgeSeconds`. |
+| `WEBHOOK_SIGNATURE_REPLAYED` | 401 | Mailgun: authentic, but the token was already used. |
 | `WEBHOOK_SIGNATURE_SECRET_UNAVAILABLE` | 401 | `secret` resolved to nothing — e.g. a secret not populated yet. |
 | `WEBHOOK_SIGNATURE_BODY_INVALID` | 400 | `mailgun-json`: the body is not JSON. `mailgun-multipart`: the body is not `multipart/form-data` with a boundary. |
 | `WEBHOOK_SIGNATURE_SECRET_UNRESOLVED` | 500 | Evaluating `secret` failed, e.g. the secret provider errored. |
-| `WEBHOOK_SIGNATURE_MISCONFIGURED` | 500 | The policy configuration is incomplete or invalid. |
+| `WEBHOOK_SIGNATURE_REPLAY_CACHE_UNAVAILABLE` | 500 | The replay cache could not be read or written. |
+| `WEBHOOK_SIGNATURE_MISCONFIGURED` | 500 | The policy configuration is incomplete or invalid, or names a cache resource that does not exist. |
 | `WEBHOOK_SIGNATURE_ERROR` | 500 | An unexpected failure — a bug, not a sender error. |
 
 ## Limitations
 
-- **Mailgun's scheme does not sign the body**, only `timestamp + token`. A captured valid triple therefore authenticates any body. Mailgun recommends rejecting stale timestamps and reused tokens; this policy does neither yet.
-- No replay protection for any provider: the providers above do not put a timestamp inside the signed message (GitHub, Meta) or put it in a separate header (Sentry).
+- **Mailgun's scheme does not sign the body.** With `maxAgeSeconds = 0` and `replayCache = ""`, a captured valid delivery authenticates any body indefinitely; see [above](#mailgun-adopt-as-is-tighten-later).
+- No replay protection for the `header` sources: GitHub and Meta put no timestamp inside the signed message, and Sentry sends one in a separate, unsigned header.
 
 ## Development
 
