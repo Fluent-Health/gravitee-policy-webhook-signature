@@ -1,0 +1,28 @@
+{
+  "zen": "Design for failure.",
+  "hook_id": 109948940,
+  "hook": {
+    "type": "Organization",
+    "id": 109948940,
+    "name": "web",
+    "active": true,
+    "events": [
+      "push",
+      "pull_request"
+    ],
+    "config": {
+      "content_type": "json",
+      "insecure_ssl": "0",
+      "url": "https://example.com/webhooks/github"
+    }
+  },
+  "organization": {
+    "login": "example-org",
+    "id": 1
+  },
+  "sender": {
+    "login": "octocat",
+    "id": 583231,
+    "type": "User"
+  }
+}

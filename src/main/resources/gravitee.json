@@ -1,0 +1,48 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "title": "Webhook Signature",
+  "description": "Verifies an HMAC-signed inbound webhook and rejects the request unless the signature matches. No property has a default: an API definition states the whole contract.",
+  "properties": {
+    "source": {
+      "type": "string",
+      "title": "Signature source",
+      "description": "Where the signature and the signed message come from. 'header': the signature is in a request header and the raw request body is signed (GitHub, Sentry, Meta/WhatsApp). 'mailgun-json': Mailgun event webhooks — timestamp + token are signed, all three values read from the JSON body's 'signature' object. 'mailgun-multipart': Mailgun routes — the same scheme, read from multipart/form-data fields.",
+      "enum": ["header", "mailgun-json", "mailgun-multipart"]
+    },
+    "header": {
+      "type": "string",
+      "title": "Signature header",
+      "description": "Request header carrying the signature, e.g. X-Hub-Signature-256. Required when source is 'header'; ignored otherwise."
+    },
+    "prefix": {
+      "type": "string",
+      "title": "Signature prefix",
+      "description": "Literal text preceding the digest in the header value, e.g. 'sha256='. Use an empty string when the provider sends a bare digest. Required when source is 'header'; ignored otherwise."
+    },
+    "algorithm": {
+      "type": "string",
+      "title": "HMAC algorithm",
+      "enum": ["HmacSHA1", "HmacSHA256", "HmacSHA512"]
+    },
+    "encoding": {
+      "type": "string",
+      "title": "Digest encoding",
+      "description": "How the received digest is encoded. Hex is compared case-insensitively.",
+      "enum": ["hex", "base64"]
+    },
+    "secret": {
+      "type": "string",
+      "title": "Signing secret",
+      "description": "The HMAC key. Supports Gravitee Expression Language, including deferred secret lookups such as {#secrets.get('...')}. A value that resolves to empty rejects every request with 401."
+    }
+  },
+  "required": ["source", "algorithm", "encoding", "secret"],
+  "if": {
+    "properties": { "source": { "const": "header" } },
+    "required": ["source"]
+  },
+  "then": {
+    "required": ["header", "prefix"]
+  }
+}
