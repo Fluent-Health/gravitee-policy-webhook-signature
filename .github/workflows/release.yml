@@ -1,0 +1,60 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+# Least privilege by default. Only the release job needs write access, to
+# attach the ZIP to the GitHub Release.
+permissions:
+  contents: read
+
+jobs:
+  # Never publish a ZIP that has not passed against every supported Gravitee
+  # version. Shares its matrix with CI.
+  integration:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/integration-matrix.yml
+
+  release:
+    needs: integration
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Extract version
+        id: version
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          VERSION="${TAG#v}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Set Maven version
+        run: |
+          mvn --batch-mode versions:set \
+              -DnewVersion=${{ steps.version.outputs.version }} \
+              -DgenerateBackupPoms=false
+
+      - name: Unit tests
+        run: mvn test --batch-mode -q
+
+      - name: Build plugin ZIP
+        run: |
+          mvn package -DskipTests --batch-mode -q
+
+      - name: Upload ZIP to GitHub Release
+        run: |
+          gh release upload ${{ github.event.release.tag_name }} \
+            target/gravitee-policy-webhook-signature-${{ steps.version.outputs.version }}.zip \
+            --clobber

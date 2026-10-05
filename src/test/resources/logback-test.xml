@@ -1,0 +1,21 @@
+<configuration>
+  <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+    <encoder><pattern>%d{HH:mm:ss.SSS} %-5level %logger{36} - %msg%n</pattern></encoder>
+  </appender>
+
+  <root level="WARN">
+    <appender-ref ref="STDOUT"/>
+  </root>
+
+  <!-- Our policy + IT class: full debug signal -->
+  <logger name="io.fluenthealth.gravitee.policy.webhooksignature" level="DEBUG"/>
+
+  <!-- Testcontainers: container lifecycle is useful, image-pull internals are not -->
+  <logger name="org.testcontainers" level="INFO"/>
+  <logger name="org.testcontainers.utility.RegistryAuthLocator" level="WARN"/>
+  <logger name="com.github.dockerjava" level="WARN"/>
+
+  <!-- WireMock's embedded Jetty is chatty on every start/stop; silence it -->
+  <logger name="org.eclipse.jetty" level="WARN"/>
+  <logger name="WireMock" level="WARN"/>
+</configuration>
